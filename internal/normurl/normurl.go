@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -74,6 +75,37 @@ func (l *Locator) SetQueryParam(param string, value string) {
 
 func (l *Locator) IsFilepath() bool {
 	return l.file
+}
+
+// Normalized returns a canonical string for the location.
+//
+// Two locations that identify the same resource produce the same result.
+// Fragments are dropped, URL query parameters are sorted, scheme and host
+// are lowercased, and "."/".." path segments are resolved.  For file paths,
+// query parameters and fragments are dropped.
+func (l *Locator) Normalized() string {
+	if l.file {
+		return filepath.Clean(l.url.Path)
+	}
+
+	u := *l.url
+	u.Fragment = ""
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+
+	if u.RawQuery != "" {
+		u.RawQuery = u.Query().Encode()
+	}
+
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	trailingSlash := strings.HasSuffix(u.Path, "/")
+	u.Path = path.Clean(u.Path)
+	if trailingSlash && u.Path != "/" {
+		u.Path += "/"
+	}
+	return u.String()
 }
 
 func New(s string) (*Locator, error) {

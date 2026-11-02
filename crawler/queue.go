@@ -7,7 +7,6 @@ import (
 	"sync"
 
 	"github.com/planetlabs/go-stac/internal/normurl"
-	"golang.org/x/sync/errgroup"
 )
 
 type taskType string
@@ -17,6 +16,7 @@ const (
 	collectionsTask = taskType("collections")
 	childrenTask    = taskType("children")
 	featuresTask    = taskType("features")
+	visitTask       = taskType("visit")
 )
 
 var validTaskTypes = map[taskType]bool{
@@ -24,12 +24,23 @@ var validTaskTypes = map[taskType]bool{
 	collectionsTask: true,
 	childrenTask:    true,
 	featuresTask:    true,
+	visitTask:       true,
 }
 
 type Task struct {
 	entry    *normurl.Locator
 	resource *normurl.Locator
 	taskType taskType
+	depth    int
+
+	// data holds an already loaded resource for a visitTask.  When nil, the
+	// resource is loaded from the task's resource location.  Data is not
+	// relied upon for tasks serialized through an external queue.
+	data Resource
+
+	// strictItems marks a visitTask for a collection discovered in a
+	// collections listing, which is expected to link to its items.
+	strictItems bool
 }
 
 func (t *Task) Entry() string {
@@ -46,18 +57,43 @@ func (t *Task) Resource() string {
 	return t.resource.String()
 }
 
+// Depth returns the traversal depth assigned to the task.
+func (t *Task) Depth() int {
+	return t.depth
+}
+
+// new creates a task for the given resource at the same depth.
 func (t *Task) new(resource *normurl.Locator, taskType taskType) *Task {
 	return &Task{
 		entry:    t.entry,
 		resource: resource,
 		taskType: taskType,
+		depth:    t.depth,
 	}
 }
 
+// child creates a task for a linked resource at depth + 1.
+func (t *Task) child(resource *normurl.Locator, taskType taskType) *Task {
+	child := t.new(resource, taskType)
+	child.depth = t.depth + 1
+	return child
+}
+
+// visit creates a task that visits an already loaded resource at depth + 1.
+func (t *Task) visit(resource *normurl.Locator, data Resource, strictItems bool) *Task {
+	child := t.child(resource, visitTask)
+	child.data = data
+	child.strictItems = strictItems
+	return child
+}
+
 type jsonTask struct {
-	Entry    *normurl.Locator
-	Resource *normurl.Locator
-	Type     string
+	Entry       *normurl.Locator
+	Resource    *normurl.Locator
+	Type        string
+	Depth       int
+	Data        *Resource
+	StrictItems bool
 }
 
 func (t *Task) UnmarshalJSON(data []byte) error {
@@ -81,14 +117,26 @@ func (t *Task) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("invalid task type: %s", t.taskType)
 	}
 
+	t.depth = jt.Depth
+	t.strictItems = jt.StrictItems
+	if jt.Data != nil {
+		t.data = *jt.Data
+	}
+
 	return nil
 }
 
 func (t *Task) MarshalJSON() ([]byte, error) {
 	jt := jsonTask{
-		Entry:    t.entry,
-		Resource: t.resource,
-		Type:     string(t.taskType),
+		Entry:       t.entry,
+		Resource:    t.resource,
+		Type:        string(t.taskType),
+		Depth:       t.depth,
+		StrictItems: t.strictItems,
+	}
+	if t.data != nil {
+		data := t.data
+		jt.Data = &data
 	}
 	return json.Marshal(jt)
 }
@@ -104,22 +152,30 @@ type Queue interface {
 // NewMemoryQueue is used if a custom queue is not provided for a crawl.
 //
 // The crawl will stop if the provided context is cancelled.  The limit is used
-// to control the number of resources that will be visited concurrently.
+// to control the number of resources that will be visited concurrently.  A
+// limit of zero or less means there is no concurrency limit.
 func NewMemoryQueue(ctx context.Context, limit int) Queue {
-	group, ctx := errgroup.WithContext(ctx)
-	group.SetLimit(limit)
-	return &memoryQueue{
+	ctx, cancel := context.WithCancel(ctx)
+	q := &memoryQueue{
 		ctx:     ctx,
-		group:   group,
+		cancel:  cancel,
 		mutex:   &sync.Mutex{},
 		buffer:  []*Task{},
 		handler: nil,
 	}
+	if limit > 0 {
+		q.slots = make(chan struct{}, limit)
+	}
+	return q
 }
 
 type memoryQueue struct {
 	ctx     context.Context
-	group   *errgroup.Group
+	cancel  context.CancelFunc
+	slots   chan struct{}
+	wg      sync.WaitGroup
+	errOnce sync.Once
+	err     error
 	mutex   *sync.Mutex
 	buffer  []*Task
 	handler Handler
@@ -134,37 +190,71 @@ func (q *memoryQueue) Add(tasks []*Task) error {
 }
 
 func (q *memoryQueue) Handle(handler Handler) {
+	q.mutex.Lock()
 	q.handler = handler
+	q.mutex.Unlock()
 	q.process()
 }
 
 func (q *memoryQueue) Wait() error {
-	return q.group.Wait()
+	q.wg.Wait()
+	return q.err
+}
+
+// acquireSlot reserves a concurrency slot.  A nil channel means the
+// concurrency limit is unlimited.  Callers must hold q.mutex.
+func (q *memoryQueue) acquireSlot() bool {
+	if q.slots == nil {
+		return true
+	}
+	select {
+	case q.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
 }
 
 func (q *memoryQueue) process() {
-	if q.handler == nil || len(q.buffer) == 0 {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+
+	if q.handler == nil || q.ctx.Err() != nil {
 		return
 	}
 
-	q.mutex.Lock()
-	count := 0
-	for _, task := range q.buffer {
-		task := task
-		added := q.group.TryGo(func() error {
-			defer q.process()
-			return q.handler(task)
-		})
-		if !added {
+	launched := []*Task{}
+	for len(q.buffer) > 0 {
+		if !q.acquireSlot() {
 			break
 		}
-		count += 1
+		task := q.buffer[0]
+		q.buffer = q.buffer[1:]
+		launched = append(launched, task)
 	}
 
-	if count > 0 {
-		q.buffer = q.buffer[count:]
+	for _, task := range launched {
+		task := task
+		q.wg.Add(1)
+		go func() {
+			// Release the slot, then refill the queue, and only mark this
+			// task done after replacement tasks have been added to the wait
+			// group so that Wait cannot return while buffered tasks remain.
+			defer func() {
+				if q.slots != nil {
+					<-q.slots
+				}
+				q.process()
+				q.wg.Done()
+			}()
+			if err := q.handler(task); err != nil {
+				q.errOnce.Do(func() {
+					q.err = err
+					q.cancel()
+				})
+			}
+		}()
 	}
-	q.mutex.Unlock()
 }
 
 var _ Queue = (*memoryQueue)(nil)

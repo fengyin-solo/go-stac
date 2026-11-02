@@ -49,7 +49,10 @@ func TestTaskMarshalJSON(t *testing.T) {
 			"Url": "https://example.com/resource",
 			"File": false
 		},
-		"Type": "resource"
+		"Type": "resource",
+		"Depth": 0,
+		"Data": null,
+		"StrictItems": false
 	}`
 	assert.JSONEq(t, expected, string(data))
 }

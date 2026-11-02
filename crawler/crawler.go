@@ -132,8 +132,9 @@ func wrapErrorHandler(handler ErrorHandler) ErrorHandler {
 type Crawler struct {
 	visitor      Visitor
 	queue        Queue
-	filter       func(string) bool
 	errorHandler ErrorHandler
+	scheduler    *scheduler
+	rootDepth    int
 }
 
 // Options for creating a crawler.
@@ -154,6 +155,11 @@ type Options struct {
 	// will be used.  When running a crawl across multiple processes, it can be useful
 	// to provide a queue that is shared across processes.
 	Queue Queue
+
+	// Optional bounds for the traversal.  Use this to limit the traversal depth,
+	// the number of visited resources, and to deduplicate normalized locations.
+	// When nil, the traversal is unbounded.
+	Bounds *Bounds
 }
 
 func applyOptions(options []*Options) *Options {
@@ -167,6 +173,9 @@ func applyOptions(options []*Options) *Options {
 		}
 		if option.ErrorHandler != nil {
 			o.ErrorHandler = option.ErrorHandler
+		}
+		if option.Bounds != nil {
+			o.Bounds = option.Bounds
 		}
 	}
 	return o
@@ -185,6 +194,10 @@ var DefaultOptions = &Options{
 func New(visitor Visitor, options ...*Options) (*Crawler, error) {
 	opt := applyOptions(append([]*Options{DefaultOptions}, options...))
 
+	if err := opt.Bounds.validate(); err != nil {
+		return nil, err
+	}
+
 	queue := opt.Queue
 	if queue == nil {
 		queue = NewMemoryQueue(context.Background(), runtime.GOMAXPROCS(0))
@@ -192,11 +205,18 @@ func New(visitor Visitor, options ...*Options) (*Crawler, error) {
 
 	c := &Crawler{
 		visitor:      visitor,
-		filter:       opt.Filter,
 		queue:        queue,
 		errorHandler: wrapErrorHandler(opt.ErrorHandler),
 	}
-	queue.Handle(c.crawl)
+	rootDepth := 0
+	if opt.Bounds != nil {
+		rootDepth = opt.Bounds.RootDepth
+	}
+	c.scheduler = newScheduler(opt.Bounds, opt.Filter, func(tasks []*Task) error {
+		return c.queue.Add(tasks)
+	})
+	c.rootDepth = rootDepth
+	queue.Handle(c.handle)
 
 	return c, nil
 }
@@ -220,17 +240,23 @@ func (c *Crawler) Add(resource string) error {
 		return locErr
 	}
 
-	addErr := c.queue.Add([]*Task{{entry: loc, resource: loc, taskType: resourceTask}})
-	if addErr != nil {
-		return addErr
-	}
-
-	return nil
+	return c.scheduler.submit([]*Task{{
+		entry:    loc,
+		resource: loc,
+		taskType: resourceTask,
+		depth:    c.rootDepth,
+	}})
 }
 
 // Wait for a crawl to finish.
 func (c *Crawler) Wait() error {
 	return c.queue.Wait()
+}
+
+// Summary returns a read-only snapshot of crawl statistics.  The stop reason
+// is finalized after Wait returns.
+func (c *Crawler) Summary() Summary {
+	return c.scheduler.snapshot()
 }
 
 // Crawl calls the visitor for each resolved resource.
@@ -255,28 +281,59 @@ func Crawl(resource string, visitor Visitor, options ...*Options) error {
 	return c.Wait()
 }
 
-func (c *Crawler) crawl(t *Task) error {
-	if c.filter != nil && !c.filter(t.resource.String()) {
-		return nil
-	}
-	var tasks []*Task
-	var err error
-	switch t.taskType {
-	case resourceTask:
-		tasks, err = c.crawlResource(t)
-	case collectionsTask:
-		tasks, err = c.crawlCollections(t)
-	case childrenTask:
-		tasks, err = c.crawlChildren(t)
-	case featuresTask:
-		tasks, err = c.crawlFeatures(t)
-	default:
-		return fmt.Errorf("unknown task type: %s", t.taskType)
-	}
+// handle is the queue handler.  Tasks only reach this handler after passing
+// the scheduler's depth, deduplication, filter, and resource budget gates.
+func (c *Crawler) handle(t *Task) error {
+	tasks, err := c.process(t)
 	if err != nil {
+		c.scheduler.fail(t)
 		return err
 	}
-	return c.queue.Add(tasks)
+	return c.scheduler.complete(t, tasks)
+}
+
+func (c *Crawler) process(t *Task) ([]*Task, error) {
+	switch t.taskType {
+	case resourceTask:
+		return c.crawlResource(t)
+	case visitTask:
+		return c.crawlVisit(t)
+	case collectionsTask:
+		return c.crawlCollections(t)
+	case childrenTask:
+		return c.crawlChildren(t)
+	case featuresTask:
+		return c.crawlFeatures(t)
+	default:
+		return nil, fmt.Errorf("unknown task type: %s", t.taskType)
+	}
+}
+
+// callVisitor records the visit in the crawl summary and invokes the visitor.
+func (c *Crawler) callVisitor(task *Task, resource Resource) error {
+	c.scheduler.noteVisited(task.depth)
+	info := &ResourceInfo{Entry: task.entry.String(), Location: task.resource.String()}
+	return c.errorHandler(c.visitor(resource, info))
+}
+
+// itemsTask resolves the "items" link of a collection and returns the
+// features task that lists its items.  The returned task may be nil when the
+// collection has no items link.
+func (c *Crawler) itemsTask(task *Task, resource Resource, strict bool) (*Task, error) {
+	links := resource.Links()
+	itemsLink := links.Rel("items", LinkTypeGeoJSON, LinkTypeApplicationJSON, LinkTypeAnyJSON, LinkTypeNone)
+	if itemsLink == nil {
+		if strict {
+			return nil, c.errorHandler(fmt.Errorf("missing items link for collection in %s", task.resource.String()))
+		}
+		return nil, nil
+	}
+	linkLoc, err := task.resource.Resolve(itemsLink["href"])
+	if err != nil {
+		return nil, c.errorHandler(err)
+	}
+	linkLoc.SetQueryParam("limit", "250")
+	return task.new(linkLoc, featuresTask), nil
 }
 
 func (c *Crawler) crawlResource(task *Task) ([]*Task, error) {
@@ -286,8 +343,7 @@ func (c *Crawler) crawlResource(task *Task) ([]*Task, error) {
 		return nil, c.errorHandler(loadErr)
 	}
 
-	info := &ResourceInfo{Entry: task.entry.String(), Location: task.resource.String()}
-	if err := c.errorHandler(c.visitor(resource, info)); err != nil {
+	if err := c.callVisitor(task, resource); err != nil {
 		if errors.Is(err, ErrStopRecursion) {
 			return nil, nil
 		}
@@ -321,14 +377,12 @@ func (c *Crawler) crawlResource(task *Task) ([]*Task, error) {
 
 	if resource.Type() == Collection {
 		// shortcut for "items" link
-		itemsLink := links.Rel("items", LinkTypeGeoJSON, LinkTypeApplicationJSON, LinkTypeAnyJSON, LinkTypeNone)
-		if itemsLink != nil {
-			linkLoc, err := task.resource.Resolve(itemsLink["href"])
-			if err != nil {
-				return nil, c.errorHandler(err)
-			}
-			linkLoc.SetQueryParam("limit", "250")
-			return []*Task{task.new(linkLoc, featuresTask)}, nil
+		itemsTask, itemsErr := c.itemsTask(task, resource, false)
+		if itemsErr != nil {
+			return nil, itemsErr
+		}
+		if itemsTask != nil {
+			return []*Task{itemsTask}, nil
 		}
 	}
 
@@ -342,16 +396,48 @@ func (c *Crawler) crawlResource(task *Task) ([]*Task, error) {
 					unhandledErr := c.errorHandler(err)
 					if unhandledErr != nil {
 						return nil, unhandledErr
-					} else {
-						continue
 					}
+					continue
 				}
-				tasks = append(tasks, task.new(linkLoc, resourceTask))
+				tasks = append(tasks, task.child(linkLoc, resourceTask))
 			}
 		}
 	}
 
 	return tasks, nil
+}
+
+// crawlVisit visits a resource that was embedded in a listing response.  The
+// embedded resource is carried on the task; when it is missing (for example
+// after a task was serialized through an external queue), the resource is
+// loaded from its location.
+func (c *Crawler) crawlVisit(task *Task) ([]*Task, error) {
+	resource := task.data
+	if resource == nil {
+		resource = Resource{}
+		if loadErr := load(task.entry, task.resource, &resource); loadErr != nil {
+			return nil, c.errorHandler(loadErr)
+		}
+	}
+
+	if err := c.callVisitor(task, resource); err != nil {
+		if errors.Is(err, ErrStopRecursion) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if resource.Type() == Collection {
+		itemsTask, itemsErr := c.itemsTask(task, resource, task.strictItems)
+		if itemsErr != nil {
+			return nil, itemsErr
+		}
+		if itemsTask != nil {
+			return []*Task{itemsTask}, nil
+		}
+	}
+
+	return nil, nil
 }
 
 func (c *Crawler) crawlCollections(task *Task) ([]*Task, error) {
@@ -367,9 +453,8 @@ func (c *Crawler) crawlCollections(task *Task) ([]*Task, error) {
 			unhandledErr := c.errorHandler(fmt.Errorf("expected collection at index %d, got %s", i, resource.Type()))
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				continue
 			}
+			continue
 		}
 		links := resource.Links()
 
@@ -378,50 +463,19 @@ func (c *Crawler) crawlCollections(task *Task) ([]*Task, error) {
 			unhandledErr := c.errorHandler(fmt.Errorf("missing self link for collection %d in %s", i, task.resource.String()))
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				continue
 			}
+			continue
 		}
 		selfLinkLoc, selfLinkErr := task.resource.Resolve(selfLink["href"])
 		if selfLinkErr != nil {
 			unhandledErr := c.errorHandler(selfLinkErr)
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				continue
 			}
+			continue
 		}
 
-		info := &ResourceInfo{Entry: task.entry.String(), Location: selfLinkLoc.String()}
-		if err := c.errorHandler(c.visitor(resource, info)); err != nil {
-			if errors.Is(err, ErrStopRecursion) {
-				continue
-			}
-			return nil, err
-		}
-
-		itemsLink := links.Rel("items", LinkTypeGeoJSON, LinkTypeApplicationJSON, LinkTypeAnyJSON, LinkTypeNone)
-		if itemsLink == nil {
-			unhandledErr := c.errorHandler(fmt.Errorf("missing items link for collection %d in %s", i, task.resource.String()))
-			if unhandledErr != nil {
-				return nil, unhandledErr
-			} else {
-				continue
-			}
-		}
-
-		itemsLinkLoc, itemsLinkErr := task.resource.Resolve(itemsLink["href"])
-		if itemsLinkErr != nil {
-			unhandledErr := c.errorHandler(itemsLinkErr)
-			if unhandledErr != nil {
-				return nil, unhandledErr
-			} else {
-				continue
-			}
-		}
-
-		itemsLinkLoc.SetQueryParam("limit", "250")
-		tasks = append(tasks, task.new(itemsLinkLoc, featuresTask))
+		tasks = append(tasks, task.visit(selfLinkLoc, resource, true))
 	}
 
 	nextLink := response.Links.Rel("next", LinkTypeApplicationJSON, LinkTypeAnyJSON, LinkTypeNone)
@@ -431,9 +485,8 @@ func (c *Crawler) crawlCollections(task *Task) ([]*Task, error) {
 			unhandledErr := c.errorHandler(err)
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				return tasks, nil
 			}
+			return tasks, nil
 		}
 		tasks = append(tasks, task.new(linkLoc, collectionsTask))
 	}
@@ -454,9 +507,8 @@ func (c *Crawler) crawlChildren(task *Task) ([]*Task, error) {
 			unhandledErr := c.errorHandler(fmt.Errorf("expected catalog or collection at index %d, got %s", i, resource.Type()))
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				continue
 			}
+			continue
 		}
 		links := resource.Links()
 
@@ -465,9 +517,8 @@ func (c *Crawler) crawlChildren(task *Task) ([]*Task, error) {
 			unhandledErr := c.errorHandler(fmt.Errorf("missing self link for %s %d in %s", resource.Type(), i, task.resource.String()))
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				continue
 			}
+			continue
 		}
 
 		selfLinkLoc, selfLinkErr := task.resource.Resolve(selfLink["href"])
@@ -475,12 +526,11 @@ func (c *Crawler) crawlChildren(task *Task) ([]*Task, error) {
 			unhandledErr := c.errorHandler(selfLinkErr)
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				continue
 			}
+			continue
 		}
 
-		tasks = append(tasks, task.new(selfLinkLoc, resourceTask))
+		tasks = append(tasks, task.child(selfLinkLoc, resourceTask))
 	}
 
 	nextLink := response.Links.Rel("next", LinkTypeApplicationJSON, LinkTypeAnyJSON, LinkTypeNone)
@@ -490,9 +540,8 @@ func (c *Crawler) crawlChildren(task *Task) ([]*Task, error) {
 			unhandledErr := c.errorHandler(err)
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				return tasks, nil
 			}
+			return tasks, nil
 		}
 		tasks = append(tasks, task.new(linkLoc, childrenTask))
 	}
@@ -513,9 +562,8 @@ func (c *Crawler) crawlFeatures(task *Task) ([]*Task, error) {
 			unhandledErr := c.errorHandler(fmt.Errorf("expected item at index %d, got %s", i, resource.Type()))
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				continue
 			}
+			continue
 		}
 
 		links := resource.Links()
@@ -524,9 +572,8 @@ func (c *Crawler) crawlFeatures(task *Task) ([]*Task, error) {
 			unhandledErr := c.errorHandler(fmt.Errorf("missing self link for item %d in %s", i, task.resource.String()))
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				continue
 			}
+			continue
 		}
 
 		selfLinkLoc, selfLinkErr := task.resource.Resolve(selfLink["href"])
@@ -534,19 +581,11 @@ func (c *Crawler) crawlFeatures(task *Task) ([]*Task, error) {
 			unhandledErr := c.errorHandler(selfLinkErr)
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				continue
 			}
+			continue
 		}
 
-		info := &ResourceInfo{Entry: task.entry.String(), Location: selfLinkLoc.String()}
-		if err := c.errorHandler(c.visitor(resource, info)); err != nil {
-			if errors.Is(err, ErrStopRecursion) {
-				// this is likely user error, may want to return the error here
-				continue
-			}
-			return nil, err
-		}
+		tasks = append(tasks, task.visit(selfLinkLoc, resource, false))
 	}
 
 	nextLink := response.Links.Rel("next", LinkTypeApplicationJSON, LinkTypeAnyJSON, LinkTypeNone)
@@ -556,9 +595,8 @@ func (c *Crawler) crawlFeatures(task *Task) ([]*Task, error) {
 			unhandledErr := c.errorHandler(err)
 			if unhandledErr != nil {
 				return nil, unhandledErr
-			} else {
-				return tasks, nil
 			}
+			return tasks, nil
 		}
 		tasks = append(tasks, task.new(linkLoc, featuresTask))
 	}

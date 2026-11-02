@@ -302,6 +302,79 @@ func TestUnmarshalJSON(t *testing.T) {
 	}
 }
 
+func TestNormalized(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "simple url",
+			input:    "https://example.com/foo/bar",
+			expected: "https://example.com/foo/bar",
+		},
+		{
+			name:     "sorted query params",
+			input:    "https://example.com/foo?b=2&a=1",
+			expected: "https://example.com/foo?a=1&b=2",
+		},
+		{
+			name:     "fragment dropped",
+			input:    "https://example.com/foo#section",
+			expected: "https://example.com/foo",
+		},
+		{
+			name:     "dot segments resolved",
+			input:    "https://example.com/a/b/../c/./d",
+			expected: "https://example.com/a/c/d",
+		},
+		{
+			name:     "scheme and host lowercased",
+			input:    "HTTPS://EXAMPLE.com/FOO",
+			expected: "https://example.com/FOO",
+		},
+		{
+			name:     "trailing slash preserved",
+			input:    "https://example.com/foo/",
+			expected: "https://example.com/foo/",
+		},
+		{
+			name:     "empty path becomes slash",
+			input:    "https://example.com",
+			expected: "https://example.com/",
+		},
+		{
+			name:     "file path cleaned",
+			input:    "/foo/bar/../baz/./qux",
+			expected: "/foo/baz/qux",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			l, err := normurl.New(c.input)
+			require.NoError(t, err)
+			assert.Equal(t, c.expected, l.Normalized())
+		})
+	}
+}
+
+func TestNormalizedEquivalent(t *testing.T) {
+	pairs := [][2]string{
+		{"https://example.com/a?x=1&y=2", "https://example.com/a?y=2&x=1"},
+		{"https://example.com/a#one", "https://example.com/a#two"},
+		{"https://Example.COM/a/", "https://example.com/a/"},
+		{"/foo/bar/../baz", "/foo/baz"},
+	}
+	for _, p := range pairs {
+		a, err := normurl.New(p[0])
+		require.NoError(t, err)
+		b, err := normurl.New(p[1])
+		require.NoError(t, err)
+		assert.Equal(t, a.Normalized(), b.Normalized(), "%s vs %s", p[0], p[1])
+	}
+}
+
 func TestMarshalJSON(t *testing.T) {
 	cases := []struct {
 		input    string
