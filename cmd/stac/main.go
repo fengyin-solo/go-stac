@@ -23,6 +23,11 @@ const (
 	// version flags
 	flagVerbose = "verbose"
 
+	// stats flags
+	flagStatsExtension = "stats-extension"
+	flagShard          = "shard"
+	flagShardOutput    = "shard-output"
+
 	// common flags
 	flagLogLevel    = "log-level"
 	flagEntry       = "entry"

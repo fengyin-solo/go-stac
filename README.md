@@ -47,6 +47,32 @@ To write out a version of a catalog or collection that includes metadata for the
 
     stac stats --entry path/to/catalog.json --output path/to/catalog-with-stats.json
 
+By default, this checks GitHub for the latest release of the STAC Stats extension.  To work offline (or to make a release reproducible), provide the extension schema URI explicitly with `--stats-extension`.  No network access is needed, and the entry resource is not modified:
+
+    stac stats \
+      --entry path/to/catalog.json \
+      --output path/to/catalog-with-stats.json \
+      --stats-extension https://stac-extensions.github.io/stats/v0.2.0/schema.json
+
+For large publications that are crawled in partitions, each partition can be written as a versioned, self-describing stats shard:
+
+    stac stats \
+      --entry path/to/partition/catalog.json \
+      --stats-extension https://stac-extensions.github.io/stats/v0.2.0/schema.json \
+      --shard-output path/to/shard.json
+
+The shards can then be merged.  Provide `--shard` once per shard (the order does not matter, the result is always the same) and optionally add the merged statistics to an entry resource.  Merging shards never accesses the network:
+
+    stac stats \
+      --shard path/to/shard-1.json \
+      --shard path/to/shard-2.json \
+      --entry path/to/catalog.json \
+      --output path/to/catalog-with-stats.json
+
+Shards are validated before they are merged.  Shards with an unknown structure version, an invalid stats extension URI, or conflicting stats extension versions produce an error, and zero counts are never reported as present.
+
+The same functionality is available to Go programs through the [`github.com/planetlabs/go-stac/stats`](https://pkg.go.dev/github.com/planetlabs/go-stac/stats) package, which provides a `Collector` for gathering statistics during a crawl and shard loading/merging helpers.
+
 ## Library Use
 
 Install the module into your project.
