@@ -1,0 +1,16 @@
+{
+  "stac_version": "1.0.0",
+  "type": "Catalog",
+  "id": "missing-item-catalog",
+  "description": "A catalog that links to an item that cannot be read",
+  "links": [
+    {
+      "rel": "item",
+      "href": "./does-not-exist.json"
+    },
+    {
+      "rel": "item",
+      "href": "../item.json"
+    }
+  ]
+}

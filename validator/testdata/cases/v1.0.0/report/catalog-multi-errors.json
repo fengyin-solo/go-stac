@@ -1,0 +1,20 @@
+{
+  "stac_version": "1.0.0",
+  "type": "Catalog",
+  "id": "multi-errors-catalog",
+  "description": "A catalog with two invalid items and one valid item",
+  "links": [
+    {
+      "rel": "item",
+      "href": "../item-missing-id.json"
+    },
+    {
+      "rel": "item",
+      "href": "./item-invalid-bbox.json"
+    },
+    {
+      "rel": "item",
+      "href": "../item.json"
+    }
+  ]
+}

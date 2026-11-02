@@ -155,6 +155,9 @@ func schemaUrl(version string, resourceType crawler.ResourceType) string {
 // with the first invalid resource and the resulting ValidationError will be
 // returned.  Context cancellation will also stop validation and the context
 // error will be returned.
+//
+// Use ValidateReport to validate every reachable resource without stopping at
+// the first invalid resource.
 func (v *Validator) Validate(ctx context.Context, resource string) error {
 	return crawler.Crawl(resource, v.validate, &crawler.Options{
 		Queue: crawler.NewMemoryQueue(ctx, v.concurrency),
@@ -184,25 +187,67 @@ func ValidateBytes(ctx context.Context, data []byte, location string) error {
 
 func (v *Validator) validate(resource crawler.Resource, info *crawler.ResourceInfo) error {
 	v.logger.Info("validating resource", "resource", info.Location)
+	issues := v.checkResource(resource, info)
+	if len(issues) != 0 {
+		return issues[0].raw
+	}
+	if v.noRecursion {
+		return crawler.ErrStopRecursion
+	}
+	return nil
+}
+
+// checkResource runs the core and extension schema checks for a single loaded
+// resource.  It returns one issue per detected problem and an empty slice when
+// the resource is valid.  The same checks are used by the fail-fast Validate
+// method and by ValidateReport.
+func (v *Validator) checkResource(resource crawler.Resource, info *crawler.ResourceInfo) []*resourceIssue {
 	version := resource.Version()
 	if version == "" {
-		return errors.New("unexpected or missing 'stac_version' member")
+		message := "unexpected or missing 'stac_version' member"
+		return []*resourceIssue{{
+			phase:   PhaseSchema,
+			message: message,
+			raw:     errors.New(message),
+		}}
 	}
 	resourceType := resource.Type()
 	if resourceType == "" {
-		return errors.New("unexpected or missing 'type' member")
+		message := "unexpected or missing 'type' member"
+		return []*resourceIssue{{
+			phase:   PhaseSchema,
+			message: message,
+			raw:     errors.New(message),
+		}}
 	}
 
-	coreSchema, loadErr := v.loadSchema(schemaUrl(version, resourceType))
+	issues := []*resourceIssue{}
+
+	coreSchemaLocation := schemaUrl(version, resourceType)
+	coreSchema, loadErr := v.loadSchema(coreSchemaLocation)
 	if loadErr != nil {
-		return loadErr
+		return append(issues, &resourceIssue{
+			phase:     PhaseError,
+			schemaURL: coreSchemaLocation,
+			message:   fmt.Sprintf("failed to load core schema: %s", loadErr),
+			raw:       loadErr,
+		})
 	}
 	coreErr := coreSchema.Validate(map[string]interface{}(resource))
 	if coreErr != nil {
 		if err, ok := coreErr.(*jsonschema.ValidationError); ok {
-			return newValidationError(info.Location, resource, err)
+			return append(issues, &resourceIssue{
+				phase:     PhaseSchema,
+				schemaURL: coreSchemaLocation,
+				schemaErr: err,
+				raw:       newValidationError(info.Location, resource, err),
+			})
 		}
-		return coreErr
+		return append(issues, &resourceIssue{
+			phase:   PhaseError,
+			message: coreErr.Error(),
+			raw:     coreErr,
+		})
 	}
 
 	for _, extension := range resource.Extensions() {
@@ -215,20 +260,32 @@ func (v *Validator) validate(resource crawler.Resource, info *crawler.ResourceIn
 
 		extensionSchema, loadErr := v.loadSchema(extensionUrl.String())
 		if loadErr != nil {
-			return loadErr
+			issues = append(issues, &resourceIssue{
+				phase:     PhaseError,
+				schemaURL: extensionUrl.String(),
+				message:   fmt.Sprintf("failed to load extension schema: %s", loadErr),
+				raw:       loadErr,
+			})
+			continue
 		}
 		extensionErr := extensionSchema.Validate(map[string]interface{}(resource))
 		if extensionErr != nil {
 			if err, ok := extensionErr.(*jsonschema.ValidationError); ok {
-				return newValidationError(info.Location, resource, err)
+				issues = append(issues, &resourceIssue{
+					phase:     PhaseExtension,
+					schemaURL: extensionUrl.String(),
+					schemaErr: err,
+					raw:       newValidationError(info.Location, resource, err),
+				})
+			} else {
+				issues = append(issues, &resourceIssue{
+					phase:   PhaseError,
+					message: extensionErr.Error(),
+					raw:     extensionErr,
+				})
 			}
-			return extensionErr
 		}
 	}
 
-	if v.noRecursion {
-		return crawler.ErrStopRecursion
-	}
-
-	return nil
+	return issues
 }

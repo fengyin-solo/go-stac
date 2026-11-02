@@ -1,0 +1,12 @@
+{
+  "stac_version": "1.0.0",
+  "type": "Catalog",
+  "id": "extension-invalid-catalog",
+  "description": "A catalog with an item that fails its extension schema",
+  "links": [
+    {
+      "rel": "item",
+      "href": "./item-eo-invalid.json"
+    }
+  ]
+}

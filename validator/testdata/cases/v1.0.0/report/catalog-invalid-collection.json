@@ -1,0 +1,16 @@
+{
+  "stac_version": "1.0.0",
+  "type": "Catalog",
+  "id": "invalid-collection-catalog",
+  "description": "A catalog with an invalid child collection and a valid sibling item",
+  "links": [
+    {
+      "rel": "child",
+      "href": "./collection-invalid.json"
+    },
+    {
+      "rel": "item",
+      "href": "../item.json"
+    }
+  ]
+}

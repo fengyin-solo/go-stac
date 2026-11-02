@@ -46,12 +46,20 @@ func load(entry *normurl.Locator, loc *normurl.Locator, value interface{}) error
 func loadFile(loc *normurl.Locator, value any) error {
 	data, readErr := os.ReadFile(loc.String())
 	if readErr != nil {
-		return fmt.Errorf("failed to read file %s: %w", loc, readErr)
+		return &LoadError{
+			Location: loc.String(),
+			Phase:    LoadRead,
+			Err:      fmt.Errorf("failed to read file %s: %w", loc, readErr),
+		}
 	}
 
 	jsonErr := json.Unmarshal(data, value)
 	if jsonErr != nil {
-		return fmt.Errorf("failed to parse %s: %w", loc, jsonErr)
+		return &LoadError{
+			Location: loc.String(),
+			Phase:    LoadParse,
+			Err:      fmt.Errorf("failed to parse %s: %w", loc, jsonErr),
+		}
 	}
 	return nil
 }
@@ -82,7 +90,11 @@ func loadUrl(loc *normurl.Locator, value any) error {
 func tryLoadUrl(loc *normurl.Locator, value any) error {
 	resp, err := httpClient.Get(loc.String())
 	if err != nil {
-		return err
+		return &LoadError{
+			Location: loc.String(),
+			Phase:    LoadRead,
+			Err:      fmt.Errorf("failed to fetch %s: %w", loc, err),
+		}
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, resp.Body)
@@ -90,12 +102,20 @@ func tryLoadUrl(loc *normurl.Locator, value any) error {
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected response for %s: %d", loc, resp.StatusCode)
+		return &LoadError{
+			Location: loc.String(),
+			Phase:    LoadRead,
+			Err:      fmt.Errorf("unexpected response for %s: %d", loc, resp.StatusCode),
+		}
 	}
 
 	jsonErr := json.NewDecoder(resp.Body).Decode(value)
 	if jsonErr != nil {
-		return fmt.Errorf("failed to parse %s: %w", loc, jsonErr)
+		return &LoadError{
+			Location: loc.String(),
+			Phase:    LoadParse,
+			Err:      fmt.Errorf("failed to parse %s: %w", loc, jsonErr),
+		}
 	}
 	return nil
 }

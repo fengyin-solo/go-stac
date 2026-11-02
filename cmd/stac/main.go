@@ -15,7 +15,9 @@ import (
 
 const (
 	// validate flags
-	flagSchema = "schema"
+	flagSchema     = "schema"
+	flagNoFailFast = "no-fail-fast"
+	flagJSON       = "json"
 
 	// make-links-absolute flags
 	flagUrl = "url"

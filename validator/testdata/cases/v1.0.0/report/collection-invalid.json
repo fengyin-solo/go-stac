@@ -1,0 +1,20 @@
+{
+  "stac_version": "1.0.0",
+  "type": "Collection",
+  "id": "invalid-collection",
+  "description": "A collection that is missing the required license member",
+  "extent": {
+    "spatial": {
+      "bbox": [[-180, -90, 180, 90]]
+    },
+    "temporal": {
+      "interval": [["2022-01-01T00:00:00Z", null]]
+    }
+  },
+  "links": [
+    {
+      "rel": "item",
+      "href": "./item-behind-invalid-collection.json"
+    }
+  ]
+}

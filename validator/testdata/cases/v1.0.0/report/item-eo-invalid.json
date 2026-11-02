@@ -1,0 +1,19 @@
+{
+  "stac_version": "1.0.0",
+  "type": "Feature",
+  "id": "eo-invalid-item",
+  "bbox": [0, 0, 0, 0],
+  "geometry": {
+    "type": "Point",
+    "coordinates": [0, 0]
+  },
+  "properties": {
+    "datetime": "2022-03-22T00:00:00Z",
+    "eo:cloud_cover": 150
+  },
+  "links": [],
+  "assets": {},
+  "stac_extensions": [
+    "https://stac-extensions.github.io/eo/v1.0.0/schema.json"
+  ]
+}
